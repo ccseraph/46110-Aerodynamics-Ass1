@@ -53,6 +53,5 @@ plot_flow_field(
     ax=ax_flow,
     stream_density=0.8,
 )
-
+plt.show()
 figures_dir = Path("figures")
-
