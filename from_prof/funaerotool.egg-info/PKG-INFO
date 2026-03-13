@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: funaerotool
+Version: 0.1.0
+Summary: Potential-flow solution around a cylinder (with optional circulation)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: matplotlib>=3.7
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"
+
+# Tool for Fundamental Aerodynamics Course
+
+Python tools for 2D potential flow demos: analytical cylinder solution (with optional circulation), reusable source/vortex-panel utilities, and a panel-method solver for airfoils. 
+
+## Quick start
+
+```bash
+python -m pip install -e .
+
+# run a couple of demos
+python examples/example_cylinder_flow.py
+python examples/example_singularity_flow_fields.py
+```
+
