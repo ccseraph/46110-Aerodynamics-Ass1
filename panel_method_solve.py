@@ -7,8 +7,11 @@ Class: 46110 Fundamentals of Aerodynamics
 -----------------------------
 """
 
+import sys
+sys.path.insert(0, 'from_prof')         # fixes our path problem
+
 # Magic function to solve all our panel method problems
-from from_prof.funaerotool.panel_method.solver import solve_closed_contour_panel_method  
+from from_prof.funaerotool.panel_method.solver import solve_closed_contour_panel_method
 
 # our functions
 from airfoil_toolbox import solve_panel_method
@@ -26,7 +29,7 @@ N = 201
 # ----------------------------
 # ---- Part 2 Ranging AoA ---- 
 # ----------------------------
-AoA_range = np.linspace(-10, 15, 26)    # range of alpha -10 to 25
+AoA_range = np.arange(-10, 16, 1)    # range of alpha -10 to 15
 Cl_list = []                            # saving lift coeficients
 
 for AoA in AoA_range:

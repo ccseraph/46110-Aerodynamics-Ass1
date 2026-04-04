@@ -10,8 +10,9 @@ This houses all the functions we create to run our code.
 Scripts can import functions from here. 
 """
 import numpy as np 
-from from_prof.funaerotool.panel_method.solver import solve_closed_contour_panel_method  
+from from_prof.funaerotool.panel_method.solver import solve_closed_contour_panel_method
 # Magic function to solve all our panel method problems ^^
+
 
 def parse_naca(code):
     # give this function the 4 digit code of the NACA airfoil
