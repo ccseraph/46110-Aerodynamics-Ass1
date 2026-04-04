@@ -1,6 +1,6 @@
 import numpy as np
 
-from funaerotool.panel_method.freestream import freestream_components
+from funaerotool.panel_method.freestream import freestream_components            # I edited this since I moved this script around. I hope it fixes my problem - Cc
 from funaerotool.panel_method.induction_matrix import (
     global_panel_induced_velocity_matrices,
 )
