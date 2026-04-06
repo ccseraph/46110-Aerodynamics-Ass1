@@ -234,3 +234,4 @@ for airfoil in airfoils:
     plt.legend()
     plt.savefig(os.path.join(results_folder, f"{airfoil}_cp_distribution.png"), dpi=300, bbox_inches="tight")
     plt.show()
+    

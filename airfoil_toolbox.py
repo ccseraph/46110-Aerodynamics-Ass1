@@ -13,6 +13,9 @@ import numpy as np
 from from_prof.funaerotool.panel_method.solver import solve_closed_contour_panel_method
 # Magic function to solve all our panel method problems ^^
 
+# more imports to work with lorenzo's xfoil code
+import os
+import subprocess
 
 def parse_naca(code):
     # give this function the 4 digit code of the NACA airfoil
@@ -108,7 +111,63 @@ def solve_panel_method(NACA_code, AoA, N=201):
     """
     return results
 
-# consider adding a function here which can mamke all our plots
-# look identical and nice looking for the overleaf
+# From Lorenzo. I added a bunch of keyword arguments
+def run_case(airfoil, xfoil_path, results_folder, re=5e6, mach=0.0, ncrit=9,
+             alpha_start=-4, alpha_end=8, alpha_step=1):
+    polar_file = f"{airfoil}_polar.txt"
+    polar_path = os.path.join(results_folder, polar_file)
+    if os.path.exists(polar_path):
+        os.remove(polar_path)
 
+    commands = [
+        f"NACA {airfoil}", "OPER", f"VISC {re}", f"MACH {mach}",
+        "ITER 150", "VPAR", f"N {ncrit}", "",
+        "PACC", polar_file, "",
+        f"ASEQ {alpha_start} {alpha_end} {alpha_step}",
+        "PACC", "", "QUIT"
+    ]
+    text = "\n".join(commands) + "\n"
+    subprocess.run(xfoil_path, input=text, text=True, cwd=results_folder)
+    return polar_path
 
+# From Lorenzo plus somme extra defensive formatting things
+def read_polar_file(file_path):
+    alpha, cl, cd = [], [], []
+    with open(file_path, "r") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                a = float(parts[0])
+                cl_val = float(parts[1])
+                cd_val = float(parts[2])
+                # sanity check - valid alpha range and positive cd
+                if -20 < a < 20 and cd_val > 0:
+                    alpha.append(a)
+                    cl.append(cl_val)
+                    cd.append(cd_val)
+            except:
+                pass
+    alpha = np.array(alpha)
+    cl = np.array(cl)
+    cd = np.array(cd)
+    _, idx = np.unique(alpha, return_index=True)
+    return alpha[idx], cl[idx], cd[idx]
+
+# From Cc to give me just the 2D friction drag coefficient
+def get_cd0(airfoil, xfoil_path, results_folder, re=5e6, alpha_start=-4, alpha_end=8, alpha_step=1):
+    commands = [
+        f"NACA {airfoil}", "OPER", f"VISC {re}", "MACH 0.0",
+        "ITER 150", "VPAR", "N 9", "",
+        "PACC", f"{airfoil}_cd0.txt", "",
+        f"ASEQ {alpha_start} {alpha_end} {alpha_step}",
+        "PACC", "", "QUIT"
+    ]
+    text = "\n".join(commands) + "\n"
+    subprocess.run(xfoil_path, input=text, text=True, 
+                   capture_output=True, cwd=results_folder)
+    
+    polar_path = os.path.join(results_folder, f"{airfoil}_cd0.txt")
+    _, _, cd = read_polar_file(polar_path)
+    return cd
