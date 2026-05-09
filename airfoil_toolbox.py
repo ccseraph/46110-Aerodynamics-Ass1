@@ -130,7 +130,7 @@ def run_case(airfoil, xfoil_path, results_folder, re=5e6, mach=0.0, ncrit=9,
     subprocess.run(xfoil_path, input=text, text=True, cwd=results_folder)
     return polar_path
 
-# From Lorenzo plus somme extra defensive formatting things
+# From Lorenzo plus somme extra defensive formatting things 
 def read_polar_file(file_path):
     alpha, cl, cd = [], [], []
     with open(file_path, "r") as f:

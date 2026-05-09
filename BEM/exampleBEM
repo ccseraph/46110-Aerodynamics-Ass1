@@ -1,0 +1,336 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.interpolate import RegularGridInterpolator, interp1d
+from scipy.optimize import minimize, brentq
+
+"""
+Blade Element Momentum (BEM) model for a 2-bladed quadcopter rotor.
+
+Goal: find the chord distribution, twist distribution, collective pitch, and
+rotational speed Omega that minimize power for a target thrust.
+
+Theory follows Leishman (2000) -- see the equations referenced in comments.
+
+Run this script directly: it will load airfoil data, optimize, and plot.
+"""
+
+# =============================================================================
+# USER INPUTS  --  EDIT THESE TO MATCH YOUR APPLICATION
+# =============================================================================
+
+# --- Geometry ---
+R = 0.59                # blade radius [m]
+n = 50                  # number of blade elements (more = smoother, slower)
+Nb = 2                  # number of blades per rotor
+r_hub_frac = 0.15       # fraction of R that is hub / no aero loading
+
+# --- Atmosphere ---
+# NOTE: rho = 0.02 kg/m^3 is Mars-like atmosphere. For Earth sea level use 1.225.
+rho = 0.02              # air density [kg/m^3]
+
+# --- Mission ---
+# Target thrust per rotor. For a quadcopter hovering with mass M_total:
+#   T_target = M_total * g_local / 4
+# Mars: g = 3.71 m/s^2.  Earth: g = 9.81 m/s^2.
+T_target = 4.6 * 3.71 / 4   # [N]   (example: 0.5 kg craft on Mars, 4 rotors)
+
+# --- Loss / correction factors ---
+kappa = 1.15            # induced power correction factor (eq. 26-27 in Leishman)
+
+# --- Airfoil data file ---
+AIRFOIL_CSV = "blade_data.csv"
+USE_RE_INTERP = False   # True = CSV has columns [alpha, Re, Cl, Cd]
+                        # False = CSV has columns [alpha, Cl, Cd] (single Re)
+
+# --- Optimizer bounds (design variables) ---
+# x = [c_tip, alpha_D_deg, theta_collective_deg, Omega]
+x0     = [0.030,  4.0,  0.0, 600.0]   # initial guess
+bounds = [(0.005, 0.040),   # c_tip [m]
+          (0.0,   10.0),    # design alpha [deg]
+          (-10.0, 15.0),    # collective pitch offset [deg]
+          (200.0, 1500.0)]  # Omega [rad/s]
+
+USE_TIP_LOSS  = True    # Prandtl tip loss correction
+USE_ROOT_LOSS = False   # Prandtl root loss (usually negligible for rotors)
+
+def prandtl_loss(phi, y, Nb, hub_frac=r_hub_frac,
+                 tip=True, root=False, eps=1e-6):
+    """Prandtl tip- (and optionally root-) loss factor F in [0, 1].
+ 
+    F multiplies the momentum-theory thrust per annulus:
+        dT_mom = 4*pi*r*rho*v_i^2 * F * dr
+    Standard derivation (e.g. Glauert; Burton et al., 'Wind Energy Handbook').
+    """
+    sin_phi = np.maximum(np.abs(np.sin(phi)), eps)
+ 
+    F = np.ones_like(y)
+ 
+    if tip:
+        f_tip = (Nb / 2.0) * (1.0 - y) / (y * sin_phi)
+        # clip to avoid arccos domain issues from rounding
+        F_tip = (2.0 / np.pi) * np.arccos(np.clip(np.exp(-f_tip), 0.0, 1.0))
+        F *= F_tip
+ 
+    if root:
+        f_root = (Nb / 2.0) * (y - hub_frac) / (y * sin_phi)
+        F_root = (2.0 / np.pi) * np.arccos(np.clip(np.exp(-f_root), 0.0, 1.0))
+        F *= F_root
+ 
+    return np.maximum(F, 1e-4)   # floor prevents division blow-ups
+
+
+# =============================================================================
+# RADIAL GRID  (built once, reused everywhere)
+# =============================================================================
+
+# y = r/R is the non-dimensional radial coordinate (Leishman uses this)
+y      = np.linspace(r_hub_frac, 1.0, n)   # avoids singularity at root
+r_arr  = y * R
+dy     = y[1] - y[0]
+
+
+# =============================================================================
+# AIRFOIL LOOKUP
+# =============================================================================
+
+def load_airfoil(path, use_re=False):
+    """Returns two callables: cl(alpha_deg, Re) and cd(alpha_deg, Re).
+
+    If use_re=False, Re argument is ignored.
+    Inputs/outputs are array-friendly.
+    """
+    df = pd.read_csv(path)
+
+    if use_re:
+        # Expect columns: alpha, Re, Cl, Cd
+        alphas = np.sort(df["alpha"].unique())
+        res    = np.sort(df["Re"].unique())
+        Cl_grid = df.pivot(index="alpha", columns="Re", values="Cl").loc[alphas, res].values
+        Cd_grid = df.pivot(index="alpha", columns="Re", values="Cd").loc[alphas, res].values
+
+        cl_interp = RegularGridInterpolator((alphas, res), Cl_grid,
+                                            bounds_error=False, fill_value=None)
+        cd_interp = RegularGridInterpolator((alphas, res), Cd_grid,
+                                            bounds_error=False, fill_value=None)
+
+        def cl(alpha_deg, Re):
+            a = np.clip(alpha_deg, alphas.min(), alphas.max())
+            R = np.clip(Re,        res.min(),    res.max())
+            return cl_interp(np.column_stack([np.atleast_1d(a).ravel(),
+                                              np.atleast_1d(R).ravel()])
+                             ).reshape(np.shape(alpha_deg))
+
+        def cd(alpha_deg, Re):
+            a = np.clip(alpha_deg, alphas.min(), alphas.max())
+            R = np.clip(Re,        res.min(),    res.max())
+            return cd_interp(np.column_stack([np.atleast_1d(a).ravel(),
+                                              np.atleast_1d(R).ravel()])
+                             ).reshape(np.shape(alpha_deg))
+    else:
+        # Expect columns: alpha, Cl, Cd  (or alpha, cl_stdy, cd_stdy)
+        col_alpha = "alpha" if "alpha" in df.columns else df.columns[0]
+        col_cl    = "Cl"    if "Cl"    in df.columns else ("cl_stdy" if "cl_stdy" in df.columns else df.columns[1])
+        col_cd    = "Cd"    if "Cd"    in df.columns else ("cd_stdy" if "cd_stdy" in df.columns else df.columns[2])
+
+        df = df.sort_values(col_alpha)
+        cl_1d = interp1d(df[col_alpha].values, df[col_cl].values,
+                         bounds_error=False,
+                         fill_value=(df[col_cl].iloc[0], df[col_cl].iloc[-1]))
+        cd_1d = interp1d(df[col_alpha].values, df[col_cd].values,
+                         bounds_error=False,
+                         fill_value=(df[col_cd].iloc[0], df[col_cd].iloc[-1]))
+
+        def cl(alpha_deg, Re=None): return cl_1d(alpha_deg)
+        def cd(alpha_deg, Re=None): return cd_1d(alpha_deg)
+
+    return cl, cd
+
+
+# =============================================================================
+# BEM SOLVER  (array-wise over all blade elements)
+# =============================================================================
+
+def solve_bem(c_arr, theta_arr, Omega, cl_fn, cd_fn, mu_air=1.81e-5):
+    """Run BEM on the radial grid for given chord and twist arrays.
+ 
+    Couples blade-element thrust (eq. 20) with Prandtl-corrected annular
+    momentum thrust (eq. 32 modified):
+        dT_mom = 4*pi*r*rho*v_i^2 * F * dr
+    """
+    Ut = Omega * r_arr
+ 
+    v_i = np.full_like(r_arr, 1.0)
+ 
+    for _ in range(300):
+        phi   = np.arctan2(v_i, Ut)
+        alpha = theta_arr - phi
+        alpha_deg = np.degrees(alpha)
+ 
+        W  = np.sqrt(Ut**2 + v_i**2)
+        Re = rho * W * c_arr / mu_air
+ 
+        Cl = cl_fn(alpha_deg, Re)
+        Cd = cd_fn(alpha_deg, Re)
+ 
+        dTbe_dr = 0.5 * rho * Nb * c_arr * W**2 * (Cl*np.cos(phi) - Cd*np.sin(phi))
+ 
+        # Prandtl loss factor uses current phi
+        F = prandtl_loss(phi, y, Nb, tip=USE_TIP_LOSS, root=USE_ROOT_LOSS)
+ 
+        # Momentum balance with tip loss: dT_be = 4*pi*r*rho*v_i^2 * F * dr
+        v_i_new = np.sqrt(np.maximum(dTbe_dr, 0.0) /
+                          (4.0 * np.pi * r_arr * rho * F + 1e-30))
+ 
+        v_i_next = 0.5 * v_i + 0.5 * v_i_new
+        if np.max(np.abs(v_i_next - v_i)) < 1e-6:
+            v_i = v_i_next
+            break
+        v_i = v_i_next
+ 
+    # --- Final loads ---
+    phi   = np.arctan2(v_i, Ut)
+    alpha = theta_arr - phi
+    alpha_deg = np.degrees(alpha)
+    W  = np.sqrt(Ut**2 + v_i**2)
+    Re = rho * W * c_arr / mu_air
+    Cl = cl_fn(alpha_deg, Re)
+    Cd = cd_fn(alpha_deg, Re)
+    F  = prandtl_loss(phi, y, Nb, tip=USE_TIP_LOSS, root=USE_ROOT_LOSS)
+ 
+    dT_dr = 0.5 * rho * Nb * c_arr * W**2 * (Cl*np.cos(phi) - Cd*np.sin(phi))
+    dQ_dr = 0.5 * rho * Nb * c_arr * W**2 * (Cl*np.sin(phi) + Cd*np.cos(phi)) * r_arr
+    dP_dr = Omega * dQ_dr
+ 
+    T = np.trapezoid(dT_dr, r_arr)
+    Q = np.trapezoid(dQ_dr, r_arr)
+    P_be = np.trapezoid(dP_dr, r_arr)
+ 
+    dPi_dr = v_i * dT_dr
+    Pi     = np.trapezoid(dPi_dr, r_arr)
+    P0     = P_be - Pi
+    P_total = kappa * Pi + P0
+ 
+    A   = np.pi * R**2
+    VT  = Omega * R
+    CT  = T       / (rho * A * VT**2)
+    CP  = P_total / (rho * A * VT**3)
+ 
+    dCT_dy = dT_dr * R / (rho * A * VT**2)
+    dCP_dy = dP_dr * R / (rho * A * VT**3)
+ 
+    return dict(T=T, Q=Q, P=P_total, P_profile=P0, P_induced=Pi,
+                CT=CT, CP=CP,
+                v_i=v_i, alpha_deg=alpha_deg, phi=phi, W=W, Re=Re,
+                Cl=Cl, Cd=Cd, F=F,
+                dT_dr=dT_dr, dP_dr=dP_dr,
+                dCT_dy=dCT_dy, dCP_dy=dCP_dy)
+
+# =============================================================================
+# DESIGN PARAMETERIZATION
+# =============================================================================
+# Following eqs. (35) and (38) of Leishman:
+#   c(r)     = c_tip / y           (hyperbolic optimum chord)
+#   theta(y) = alpha_D + (1/y) * sqrt(C_T / 2)        + theta_collective
+# With theta_collective as a free pitch offset the optimizer can use.
+# =============================================================================
+
+def build_blade(c_tip, alpha_D_deg, theta_coll_deg, T_for_twist=None):
+    """Construct chord and pitch arrays from scalar design parameters.
+
+    T_for_twist : thrust used in eq. (38) for twist sizing. If None, uses
+                  T_target so the optimizer doesn't chase its own tail.
+    """
+    A  = np.pi * R**2
+    if T_for_twist is None:
+        T_for_twist = T_target
+    CT_design = T_for_twist / (rho * A * (Omega_for_twist[0])**2 * R**2 + 1e-30)
+    # eq. (38):  theta(y) = alpha_D + (1/y) * sqrt(CT/2)
+    twist_rad = np.radians(alpha_D_deg) + (1.0 / y) * np.sqrt(max(CT_design, 1e-9) / 2.0)
+    # add collective offset
+    theta_arr = twist_rad + np.radians(theta_coll_deg)
+
+    # eq. (35): c(r) = c_tip / y
+    c_arr = c_tip / y
+    return c_arr, theta_arr
+
+
+# Mutable holder so build_blade can see the current Omega during optimization
+Omega_for_twist = [x0[3]]
+
+
+# =============================================================================
+# OPTIMIZATION
+# =============================================================================
+
+def objective(x, cl_fn, cd_fn):
+    c_tip, alpha_D, theta_coll, Omega = x
+    Omega_for_twist[0] = Omega
+    c_arr, theta_arr = build_blade(c_tip, alpha_D, theta_coll)
+    out = solve_bem(c_arr, theta_arr, Omega, cl_fn, cd_fn)
+    # Penalty for missing the thrust target (soft constraint)
+    thrust_err = (out["T"] - T_target) / T_target
+    penalty = 1e4 * thrust_err**2
+    return out["P"] + penalty
+
+
+def run_optimization(cl_fn, cd_fn):
+    res = minimize(objective, x0, args=(cl_fn, cd_fn),
+                   method="Nelder-Mead", bounds=bounds,
+                   options=dict(xatol=1e-5, fatol=1e-5, maxiter=2000, disp=True))
+    return res
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    input_path = Path(__file__).parent / AIRFOIL_CSV
+    cl_fn, cd_fn = load_airfoil(path = input_path, use_re=USE_RE_INTERP)
+
+    print(f"Target thrust per rotor: {T_target:.3f} N")
+    print(f"Optimizing... (n={n} elements)")
+    res = run_optimization(cl_fn, cd_fn)
+    c_tip, alpha_D, theta_coll, Omega = res.x
+
+    c_arr, theta_arr = build_blade(c_tip, alpha_D, theta_coll)
+    out = solve_bem(c_arr, theta_arr, Omega, cl_fn, cd_fn)
+
+    print("\n=== Optimal design ===")
+    print(f"  c_tip               = {c_tip*1000:.2f} mm")
+    print(f"  alpha_design        = {alpha_D:.2f} deg")
+    print(f"  collective pitch    = {theta_coll:.2f} deg")
+    print(f"  Omega               = {Omega:.1f} rad/s  ({Omega*60/(2*np.pi):.0f} RPM)")
+    print(f"  tip speed           = {Omega*R:.1f} m/s")
+    print(f"  Thrust              = {out['T']:.3f} N  (target {T_target:.3f} N)")
+    print(f"  Power               = {out['P']:.2f} W   (induced {out['P_induced']:.2f}, profile {out['P_profile']:.2f})")
+    print(f"  C_T                 = {out['CT']:.5f}")
+    print(f"  C_P                 = {out['CP']:.6f}")
+    print(f"  Figure of merit     = {out['CT']**1.5 / (np.sqrt(2)*out['CP']):.3f}")
+
+    # ----- Plots -----
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+
+    axes[0,0].plot(y, c_arr*1000, lw=2)
+    axes[0,0].set_xlabel("r/R"); axes[0,0].set_ylabel("chord [mm]")
+    axes[0,0].set_title("Optimal chord distribution"); axes[0,0].grid(True)
+
+    axes[0,1].plot(y, np.degrees(theta_arr), lw=2, label="total pitch")
+    axes[0,1].plot(y, out["alpha_deg"],      lw=2, label=r"$\alpha$ (effective)")
+    axes[0,1].set_xlabel("r/R"); axes[0,1].set_ylabel("[deg]")
+    axes[0,1].set_title("Twist & local AoA"); axes[0,1].legend(); axes[0,1].grid(True)
+
+    axes[1,0].plot(y, out["dCT_dy"], lw=2)
+    axes[1,0].set_xlabel("r/R"); axes[1,0].set_ylabel(r"$dC_T/dy$")
+    axes[1,0].set_title("Spanwise thrust loading"); axes[1,0].grid(True)
+
+    axes[1,1].plot(y, out["dCP_dy"], lw=2)
+    axes[1,1].set_xlabel("r/R"); axes[1,1].set_ylabel(r"$dC_P/dy$")
+    axes[1,1].set_title("Spanwise power loading"); axes[1,1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig("bem_results.png", dpi=120)
+    print("\nSaved plot to bem_results.png")
+    plt.show()
